@@ -6,23 +6,29 @@ import numpy as np
 import io
 import cv2
 from scipy.integrate import odeint
+import base64
+import matplotlib.pyplot as plt
 
-# Create FastAPI instance
 app = FastAPI()
 
-# Allow all origins for CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all HTTP methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Load the saved model
 model = load_model('concrete_crack_detector_model.keras')
 
-# Preprocessing function
+def fig_to_base64(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close(fig)
+    return img_base64
+
 def preprocess_image(image: Image.Image) -> np.ndarray:
     image = image.resize((120, 120))
     if image.mode != "RGB":
@@ -30,7 +36,6 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
     image_array = np.array(image) / 255.0
     return np.expand_dims(image_array, axis=0)
 
-# Crack characteristic functions
 def calculate_crack_ratio(contour, image_shape):
     crack_area = cv2.contourArea(contour)
     total_area = image_shape[0] * image_shape[1]
@@ -66,45 +71,70 @@ def predict_crack_growth(initial_crack_depth, num_days):
 
     return final_crack_size, critical_day
 
-# API route to upload an image and get a prediction
 @app.post("/predict/")
 async def predict_crack(file: UploadFile = File(...), num_days: int = Form(30)):
-    # Read uploaded image
     image_data = await file.read()
     image = Image.open(io.BytesIO(image_data))
     
-    # Preprocess the image and make prediction
     image_array = preprocess_image(image)
     prediction = model.predict(image_array)
     result = "Crack detected" if prediction[0] >= 0.5 else "No crack detected"
 
-    # Further analysis if crack detected
+    gray_image = cv2.cvtColor((image_array[0] * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+
+    fig, ax = plt.subplots()
+    ax.imshow(gray_image, cmap='gray')
+    ax.axis('off')
+    gray_image_base64 = fig_to_base64(fig)
+
+    _, binary_image = cv2.threshold(gray_image, 127, 255, cv2.THRESH_BINARY_INV)
+    fig, ax = plt.subplots()
+    ax.imshow(binary_image, cmap='gray')
+    ax.axis('off')
+    binary_image_base64 = fig_to_base64(fig)
+
+    contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour_image = np.copy(image_array[0])
+    cv2.drawContours(contour_image, contours, -1, (0, 255, 0), 2)
+    fig, ax = plt.subplots()
+    ax.imshow(contour_image)
+    ax.axis('off')
+    contour_image_base64 = fig_to_base64(fig)
+
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        cv2.rectangle(image_array[0], (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+        fig, ax = plt.subplots()
+        ax.imshow(image_array[0])
+        ax.axis('off')
+        bounding_box_image_base64 = fig_to_base64(fig)
+
+    analysis = None
+
     if result == "Crack detected":
-        image = image.resize((120, 120))
-        image_np = np.array(image)
-        gray_image = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        _, binary_image = cv2.threshold(gray_image, 127, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        crack_ratio = calculate_crack_ratio(largest_contour, image_array[0].shape)
+        crack_depth = estimate_crack_depth(gray_image, largest_contour)
 
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            crack_ratio = calculate_crack_ratio(largest_contour, image_np.shape)
-            crack_depth = estimate_crack_depth(gray_image, largest_contour)
+        final_crack_size, critical_day = predict_crack_growth(crack_depth, num_days)
 
-            # Predict crack growth
-            final_crack_size, critical_day = predict_crack_growth(crack_depth, num_days)
+        analysis = {
+            "crack_ratio": crack_ratio,
+            "estimated_depth_mm": round(crack_depth, 2),
+            "predicted_growth_mm": round(final_crack_size, 2),
+            "critical_day": critical_day
+        }
 
-            analysis = {
-                "crack_ratio": crack_ratio,
-                "estimated_depth_mm": crack_depth,
-                "predicted_growth_mm": final_crack_size,
-                "critical_day": critical_day
-            }
-        else:
-            analysis = None
-    else:
-        analysis = None
-
-    return {"result": result, "analysis": analysis}
+    return {
+        "result": result,
+        "analysis": analysis,
+        "data": {
+            "grayscale_image": gray_image_base64,
+            "binary_image": binary_image_base64,
+            "contour_image": contour_image_base64,
+            "bounding_box_image": bounding_box_image_base64
+        }
+    }
 
 # To run the app, use: uvicorn app:app --reload
